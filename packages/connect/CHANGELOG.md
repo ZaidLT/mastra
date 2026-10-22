@@ -1,5 +1,105 @@
 # @mastra/connect
 
+## 1.2.0-alpha.0
+
+### Minor Changes
+
+- In-chat connect prompts for end-user connections. Resource-scoped `tools({ resourceId })` resolutions now include a built-in `request_connection` tool: when a task needs a provider the user hasn't connected, the agent calls it and gets a structured `connect-prompt` payload listing connectable providers with their current connection state, which chat UIs render as a connect card. The connectable set follows the `providers` allowlist when one is set, otherwise the full catalog. The tool is never added to global-only resolutions. ([#26928](https://github.com/mastra-ai/mastra/pull/26928))
+
+  ```ts
+  import { tools } from '@mastra/connect';
+
+  export const agent = new Agent({
+    // ...
+    tools: ctx => tools({ resourceId: ctx.requestContext.get('mastra__resourceId') }),
+  });
+
+  // Opt out of the built-in tool:
+  tools({ resourceId: userId, connectPrompt: false });
+  ```
+
+  `userConnectRoutes()` `providers` is now optional: omit it to expose the full platform catalog on the end-user connect surface. An explicit empty array is still rejected, and configuring an allowlist behaves exactly as before.
+
+  ```ts
+  // All catalog providers are connectable:
+  userConnectRoutes();
+
+  // Or restrict to an allowlist, as before:
+  userConnectRoutes({ providers: ['linear', 'slack'] });
+  ```
+
+- Added end-user (per-resource) connections to @mastra/connect. ([#26928](https://github.com/mastra-ai/mastra/pull/26928))
+
+  **Scope tools to an end user**
+
+  `tools()` accepts a new `resourceId` option — a static key or a callback derived per request — so an agent resolves the shared global connections plus that end user's own connections. Every platform call made under a resource scope asserts the key, so one user's connection can never serve another user's request.
+
+  ```ts
+  import { tools } from '@mastra/connect';
+
+  // Per-request scoping on an agent:
+  new Agent({ tools: ctx => tools({ resourceId: myUserIdFrom(ctx) }) });
+
+  // Static/global usage is unchanged:
+  new Agent({ tools: tools({ providers: ['linear'] }) });
+  ```
+
+  Calling `tools()` per request is cheap: identical options share one internal snapshot/MCP-client state, with per-resource caching and eviction. The returned resolver is also awaitable, so a dynamic `tools` argument can return it directly.
+
+  **Let end users connect their own accounts**
+
+  A new `userConnectRoutes()` export returns mountable API routes (provider catalog, the caller's connections, connect sessions, status polling, disconnect, and a hosted connect page) gated on the authenticated end user's resource key from `server.auth.mapUserToResourceId`.
+
+  ```ts
+  import { Mastra } from '@mastra/core';
+  import { userConnectRoutes } from '@mastra/connect';
+
+  export const mastra = new Mastra({
+    server: {
+      auth: {
+        authenticateToken: async token => verifyToken(token),
+        mapUserToResourceId: user => user.id,
+      },
+      apiRoutes: [...userConnectRoutes({ providers: ['linear', 'slack'] })],
+    },
+  });
+  ```
+
+  `credential()` also gains an optional `resourceId` option for asserting a resource-scoped connection's key.
+
+- Added project-managed provider policies for end-user connections. When `providers` is omitted, `userConnectRoutes()` and the built-in `request_connection` tool now use the project provider list from Mastra Platform. An explicit code allowlist still takes priority. ([#26928](https://github.com/mastra-ai/mastra/pull/26928))
+
+  ```typescript
+  // Use the project policy from Mastra Platform.
+  userConnectRoutes({});
+
+  // Or enforce a code-level override.
+  userConnectRoutes({ providers: ['linear', 'slack'] });
+  ```
+
+### Patch Changes
+
+- Gate end-user connect flows behind a launch route. The vendor authorization link is a bearer capability (anyone who opens it can bind their account to the pending connection), so it now stays server-side: the new `GET /connect/connections/:id/launch` route verifies the caller owns the pending session before 302-redirecting into the provider's OAuth flow, and a forwarded or leaked launch URL returns 404 for anyone but the session owner. The hosted connect page navigates its popup through the launch route automatically. ([#26928](https://github.com/mastra-ai/mastra/pull/26928))
+
+  Breaking response change for custom UIs: `POST /connect/:provider/sessions` now returns `launchUrl` (a server-relative path to the launch route) instead of `connectUrl`. Migrate by navigating to the launch route with the user's session instead of the vendor link:
+
+  ```diff
+   const session = await fetch(`${serverUrl}/connect/linear/sessions`, {
+     method: 'POST',
+     headers: authHeaders,
+   }).then(res => res.json());
+
+  -popup.location.href = session.connectUrl;
+  +// Same-origin authenticated navigation; the server verifies ownership
+  +// before redirecting into the vendor OAuth flow.
+  +popup.location.href = `${serverUrl}${session.launchUrl}`;
+  ```
+
+- Updated dependencies [[`a15ea70`](https://github.com/mastra-ai/mastra/commit/a15ea70e71ca57242fa61b23e7f0178d77f9af4b), [`a15ea70`](https://github.com/mastra-ai/mastra/commit/a15ea70e71ca57242fa61b23e7f0178d77f9af4b), [`c253e13`](https://github.com/mastra-ai/mastra/commit/c253e13ac627d0325f8665004f7af8a49805a9a4), [`c8f8e41`](https://github.com/mastra-ai/mastra/commit/c8f8e410d39a29b8b69cb7bf90cc9a774cb956f5), [`a1e248b`](https://github.com/mastra-ai/mastra/commit/a1e248bfe0776ab6ca2a55fed3c423b08fb5ae03), [`0afde2c`](https://github.com/mastra-ai/mastra/commit/0afde2c114aa02b0186ae963c8c83796f8801b60), [`a5a9179`](https://github.com/mastra-ai/mastra/commit/a5a9179daa5ac1ed49447265038208c9f96cd0f8), [`8e1247c`](https://github.com/mastra-ai/mastra/commit/8e1247cb26fc1a3cd1c2ac6edaf34fddad897852), [`ed76bdc`](https://github.com/mastra-ai/mastra/commit/ed76bdcc88e09c0f7f0da14ffadca62b1b4a2409), [`2f655e5`](https://github.com/mastra-ai/mastra/commit/2f655e53fcae10a2423e0194a113ce52e70580fe), [`be5c929`](https://github.com/mastra-ai/mastra/commit/be5c9292ac6d4beb7f1020d0dc745edd18842f3d), [`c9ff73d`](https://github.com/mastra-ai/mastra/commit/c9ff73dd24e9473cb0008857105367c99ba839cb), [`db2a1a6`](https://github.com/mastra-ai/mastra/commit/db2a1a659ecb057ae9ff6798a501ed33dd38b7c7), [`6a4a607`](https://github.com/mastra-ai/mastra/commit/6a4a607e710000e46790e20f28c2355af9ca2a05), [`8ae87fa`](https://github.com/mastra-ai/mastra/commit/8ae87fadd01daa128086e015473881bf55d6e47b), [`20f40eb`](https://github.com/mastra-ai/mastra/commit/20f40ebf5623b059336f4c3000d47755941b4451), [`bfce5b6`](https://github.com/mastra-ai/mastra/commit/bfce5b6982dc17a6944484b1ee9b333f6f5023d6), [`875a657`](https://github.com/mastra-ai/mastra/commit/875a65748d5e03b436bab01d7f9fe782fa2941e7), [`d58fe2a`](https://github.com/mastra-ai/mastra/commit/d58fe2ac5cd64a96dca05657f07df18f23db14e1), [`a1e248b`](https://github.com/mastra-ai/mastra/commit/a1e248bfe0776ab6ca2a55fed3c423b08fb5ae03), [`bd508a2`](https://github.com/mastra-ai/mastra/commit/bd508a2dec8c550baec245bfffc2d0853386e2eb), [`875a657`](https://github.com/mastra-ai/mastra/commit/875a65748d5e03b436bab01d7f9fe782fa2941e7), [`578cb67`](https://github.com/mastra-ai/mastra/commit/578cb670bd8621538eda4afc1f25139e5903aab9), [`875a657`](https://github.com/mastra-ai/mastra/commit/875a65748d5e03b436bab01d7f9fe782fa2941e7), [`8c61247`](https://github.com/mastra-ai/mastra/commit/8c6124708341d699c3b1f3bb19f19be468923483), [`66da6af`](https://github.com/mastra-ai/mastra/commit/66da6af573224af3daeb8767cddbd6112ad2c5e4), [`17444a7`](https://github.com/mastra-ai/mastra/commit/17444a7e46b656b3877faad6e61d5637f435b291), [`f3bc1ca`](https://github.com/mastra-ai/mastra/commit/f3bc1caddb161453f8e2636fd0fc96d9b60e2719)]:
+  - @mastra/core@1.80.0-alpha.0
+  - @mastra/mcp@2.6.0-alpha.0
+  - @mastra/slack@1.8.0-alpha.0
+
 ## 1.1.0
 
 ### Minor Changes

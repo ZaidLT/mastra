@@ -1,5 +1,37 @@
 # @mastra/react
 
+## 1.13.0-alpha.0
+
+### Minor Changes
+
+- Added `useQuerySpans` and `useSpanQueryAvailable` hooks for listing individual spans from observability stores that support span queries. `useQuerySpans` loads spans with cursor-based infinite scroll: attach `setEndOfListElement` to the last row and the next page loads when it scrolls into view. You can also call `fetchNextPage` yourself, and `hasNextPage` tells you whether more spans remain. ([#27989](https://github.com/mastra-ai/mastra/pull/27989))
+
+  ```tsx
+  import { useSpanQueryAvailable } from '@mastra/react/hooks/capabilities';
+  import { useQuerySpans } from '@mastra/react/hooks/traces';
+
+  const { enabled } = useSpanQueryAvailable();
+  const { spans, hasNextPage, isFetchingNextPage, setEndOfListElement } = useQuerySpans({
+    query: { timeRange: { from, to }, orderBy: [{ field: 'startedAt', direction: 'desc' }] },
+    enabled,
+  });
+  ```
+
+- Added `useSpanAggregateAvailable()`, which reports whether the server supports `aggregateSpans()`. ([#27827](https://github.com/mastra-ai/mastra/pull/27827))
+
+  ```tsx
+  const { isLoading, enabled } = useSpanAggregateAvailable();
+  if (!isLoading && enabled) {
+    // render span aggregate charts
+  }
+  ```
+
+### Patch Changes
+
+- Updated dependencies [[`a15ea70`](https://github.com/mastra-ai/mastra/commit/a15ea70e71ca57242fa61b23e7f0178d77f9af4b), [`c253e13`](https://github.com/mastra-ai/mastra/commit/c253e13ac627d0325f8665004f7af8a49805a9a4), [`c8f8e41`](https://github.com/mastra-ai/mastra/commit/c8f8e410d39a29b8b69cb7bf90cc9a774cb956f5), [`a1e248b`](https://github.com/mastra-ai/mastra/commit/a1e248bfe0776ab6ca2a55fed3c423b08fb5ae03), [`0afde2c`](https://github.com/mastra-ai/mastra/commit/0afde2c114aa02b0186ae963c8c83796f8801b60), [`a5a9179`](https://github.com/mastra-ai/mastra/commit/a5a9179daa5ac1ed49447265038208c9f96cd0f8), [`8e1247c`](https://github.com/mastra-ai/mastra/commit/8e1247cb26fc1a3cd1c2ac6edaf34fddad897852), [`ed76bdc`](https://github.com/mastra-ai/mastra/commit/ed76bdcc88e09c0f7f0da14ffadca62b1b4a2409), [`2f655e5`](https://github.com/mastra-ai/mastra/commit/2f655e53fcae10a2423e0194a113ce52e70580fe), [`be5c929`](https://github.com/mastra-ai/mastra/commit/be5c9292ac6d4beb7f1020d0dc745edd18842f3d), [`c9ff73d`](https://github.com/mastra-ai/mastra/commit/c9ff73dd24e9473cb0008857105367c99ba839cb), [`db2a1a6`](https://github.com/mastra-ai/mastra/commit/db2a1a659ecb057ae9ff6798a501ed33dd38b7c7), [`b3ea314`](https://github.com/mastra-ai/mastra/commit/b3ea314a3a6f0ae061b6ae81d4124be66a79a70c), [`6a4a607`](https://github.com/mastra-ai/mastra/commit/6a4a607e710000e46790e20f28c2355af9ca2a05), [`8ae87fa`](https://github.com/mastra-ai/mastra/commit/8ae87fadd01daa128086e015473881bf55d6e47b), [`20f40eb`](https://github.com/mastra-ai/mastra/commit/20f40ebf5623b059336f4c3000d47755941b4451), [`bfce5b6`](https://github.com/mastra-ai/mastra/commit/bfce5b6982dc17a6944484b1ee9b333f6f5023d6), [`2afea6f`](https://github.com/mastra-ai/mastra/commit/2afea6f00bdb4da7a336be9f8ee79f449ed815a6), [`875a657`](https://github.com/mastra-ai/mastra/commit/875a65748d5e03b436bab01d7f9fe782fa2941e7), [`d58fe2a`](https://github.com/mastra-ai/mastra/commit/d58fe2ac5cd64a96dca05657f07df18f23db14e1), [`bd508a2`](https://github.com/mastra-ai/mastra/commit/bd508a2dec8c550baec245bfffc2d0853386e2eb), [`578cb67`](https://github.com/mastra-ai/mastra/commit/578cb670bd8621538eda4afc1f25139e5903aab9), [`875a657`](https://github.com/mastra-ai/mastra/commit/875a65748d5e03b436bab01d7f9fe782fa2941e7), [`8c61247`](https://github.com/mastra-ai/mastra/commit/8c6124708341d699c3b1f3bb19f19be468923483), [`17444a7`](https://github.com/mastra-ai/mastra/commit/17444a7e46b656b3877faad6e61d5637f435b291)]:
+  - @mastra/core@1.80.0-alpha.0
+  - @mastra/client-js@1.57.0-alpha.0
+
 ## 1.12.0
 
 ### Minor Changes

@@ -1,5 +1,113 @@
 # @mastra/core
 
+## 1.80.0-alpha.0
+
+### Minor Changes
+
+- Added render-only tools that stream display calls and let agents and sub-agents continue without a client result. Use `renderOnly: true` when the browser only needs to show the call: ([#28082](https://github.com/mastra-ai/mastra/pull/28082))
+
+  ```typescript
+  import { createTool } from '@mastra/core/tools';
+  import { z } from 'zod';
+
+  const showCard = createTool({
+    id: 'show-card',
+    description: 'Display a product card',
+    inputSchema: z.object({ productId: z.string() }),
+    renderOnly: true,
+  });
+  ```
+
+- Added a `textDisplay` channel adapter option. Set `textDisplay: 'hidden'` to stop posting the agent's reply text, for example when the agent replies through a tool you give it. Tool display, approval prompts, errors and typing status still show, and the text still reaches the agent's stream and memory. ([#28067](https://github.com/mastra-ai/mastra/pull/28067))
+
+  ```ts
+  channels: {
+    adapters: {
+      slack: {
+        adapter: createSlackAdapter(),
+        textDisplay: 'hidden',
+      },
+    },
+  },
+  ```
+
+- Added `get(pid, { release: false })` to the sandbox process manager. It reads a process without dismissing it once it has exited, so one reader can look at a finished command's output without taking it from another, such as the agent that started it. The default is unchanged. ([#27919](https://github.com/mastra-ai/mastra/pull/27919))
+
+  ```ts
+  // Show a finished command's output without dismissing it
+  const handle = await sandbox.processes.get(pid, { release: false });
+  console.log(handle?.stdout);
+  ```
+
+### Patch Changes
+
+- dependencies updates: ([#28018](https://github.com/mastra-ai/mastra/pull/28018))
+  - Updated dependency [`@modelcontextprotocol/server@2.3.1` ↗︎](https://www.npmjs.com/package/@modelcontextprotocol/server/v/2.3.1) (from `2.2.0`, in `devDependencies`)
+
+- Update provider registry and model documentation with latest models and providers ([`c253e13`](https://github.com/mastra-ai/mastra/commit/c253e13ac627d0325f8665004f7af8a49805a9a4))
+
+- Fixed background tasks staying `running` forever when their background-task workflow run ended as failed before a terminal status was saved (for example, when the storage write that marks the task completed throws). The task is now marked `failed` with the error recorded, and `onFailed`/`onTaskFailed` hooks and the `task.failed` event fire once. ([#27933](https://github.com/mastra-ai/mastra/pull/27933))
+
+  A per-task `onResult`, `onComplete` or `onFailed` hook that throws no longer stops the `task.completed`/`task.failed` event from being published, so the global `onTaskComplete`/`onTaskFailed` callbacks still fire.
+
+- `@mastra/core/channels` now exports `CHAT_CHANNEL_RENDER_CONTEXT_KEY` and the `ChatChannelRenderContext` type, so tools resolved per request can reach the live chat thread a run is replying in (for example, to upload a file into it). ([#27351](https://github.com/mastra-ai/mastra/pull/27351))
+
+- Reject contained local filesystem reads and directory listings when a symlink swap is detected outside configured roots; preserve metadata access to unreadable files. ([#28092](https://github.com/mastra-ai/mastra/pull/28092))
+
+- Signal contents now reach the model as written inside their tag. Previously `&`, `<` and `>` were turned into `&amp;`, `&lt;` and `&gt;`, so commands and code in reminders, notifications and other signals arrived mangled. ([#27150](https://github.com/mastra-ai/mastra/pull/27150))
+
+  ```ts
+  await agent.sendSignal(
+    {
+      type: 'reactive',
+      tagName: 'skill',
+      attributes: { name: 'release' },
+      contents: 'Run `pnpm build && pnpm test 2>&1`.',
+    },
+    { resourceId, threadId },
+  );
+  // Before: <skill name="release">Run `pnpm build &amp;&amp; pnpm test 2&gt;&amp;1`.</skill>
+  // After:  <skill name="release">Run `pnpm build && pnpm test 2>&1`.</skill>
+  ```
+
+  A closing tag for the signal's own tag inside its contents, such as `</skill>`, is still escaped so contents can't end the tag early. Attribute values are still escaped.
+
+- Fixed `generate()`, `resumeStream()`, and `resumeGenerate()` to reject invalid `modelSettings.timeout` values with the same `TypeError`. Durable and evented agents now reject invalid resolved timeouts before acquiring an initial execution claim, and validate caller settings and static defaults before cold recovery executes. A rejected resume leaves the suspended run available for a retry with corrected settings. ([#28030](https://github.com/mastra-ai/mastra/pull/28030))
+
+- Fixed durable and evented agent streams dropping provider metadata from successful tool-result chunks, including sub-agent text output mappings, while preserving original tool-call metadata in payload-transform callbacks. ([#28025](https://github.com/mastra-ai/mastra/pull/28025))
+
+- Fixed `LocalFilesystem` so writes through symlinked parent directories cannot create files or directories outside the workspace or allowed paths. Writes outside those roots now throw `PermissionError`. Symlinked writes within allowed roots still succeed. Fixes #27916. ([#28148](https://github.com/mastra-ai/mastra/pull/28148))
+
+- Restore the persisted delegation tool call on a cold durable-agent resume before updating suspension metadata. This keeps the next sub-agent suspension in memory when a replacement instance resumes with observational memory enabled. ([#28050](https://github.com/mastra-ai/mastra/pull/28050))
+
+- Fixed the evented workflow engine reporting a `foreach` step as `success` while its iterations were still running. The stored step now stays `running` (no `endedAt`) until every iteration finishes, and `getWorkflowRunById` no longer shows unfinished iterations as `null` entries in the step output, matching the default engine. ([#27932](https://github.com/mastra-ai/mastra/pull/27932))
+
+  When an iteration suspends, the step also stays `running` while sibling iterations are still in flight, and becomes `suspended` only once all of them settle. A suspended `foreach` step no longer gets an `endedAt`, matching the default engine.
+
+- Keep recalled messages as memory references in durable-agent checkpoints when `messageHistory.maxTokens` is set. Token counting adds framework-owned estimate caches to messages in memory; exclude only those cache entries from the saved-message identity comparison while retaining stored message content and caller-supplied metadata. ([#28049](https://github.com/mastra-ai/mastra/pull/28049))
+
+- Record a `tool_call` span for tool calls served by experiment `toolMocks`. The span carries the mocked output and the attribute `mocked: true`, so experiment traces show mocked calls next to model steps instead of only inside the model step output. ([#27954](https://github.com/mastra-ai/mastra/pull/27954))
+
+- Exported `readNotificationRoutingRequirement` from `@mastra/core/notifications`, so a notification delivery policy can tell whether a notification was routed to the thread's claimed owner. ([#28066](https://github.com/mastra-ai/mastra/pull/28066))
+
+  ```ts
+  import { readNotificationRoutingRequirement } from '@mastra/core/notifications';
+
+  const routedToOwner = readNotificationRoutingRequirement(record.metadata)?.requireClaimedOwner === true;
+  ```
+
+- Fixed durable and evented onFinish tool results to use the same chunk shape as the default engine, including per-step results. Fixes #27428. ([#28145](https://github.com/mastra-ai/mastra/pull/28145))
+
+- Fixed channel messages and tool approval actions bypassing durable execution on durable and evented agents, including channels attached after construction. ([#27944](https://github.com/mastra-ai/mastra/pull/27944))
+
+- Fixed `onFinish.text` including replies rejected by `processOutputStep` guardrails, including discarded retry attempts on durable agents. Earlier accepted step text is preserved. Fixes [COR-1464](https://linear.app/kepler-crm/issue/COR-1464/processoutputstep-abort-cover-evented-and-compare-all-three-engines). ([#28029](https://github.com/mastra-ai/mastra/pull/28029))
+
+- Fixed channel agents calling a missing `add_reaction` tool. The channel instructions now mention reacting only when the agent has the `add_reaction` tool, for example via `channels.getTools()`. ([#28067](https://github.com/mastra-ai/mastra/pull/28067))
+
+- Fixed durable and evented streams dropping the suspending step's token usage. `usage` and `totalUsage` now settle when the run suspends for a tool call or an approval, including steps that already ran, and a resume still replaces those numbers with the cumulative total. ([#27882](https://github.com/mastra-ai/mastra/pull/27882))
+
+- Fixed trace scoring for agent scorers: tool calls that start in the same millisecond (parallel tool calls) now keep their original order, and tools executed by the model provider (for example Anthropic web search) are now included in the scorer's tool invocations, matching what live scoring sees. ([#27953](https://github.com/mastra-ai/mastra/pull/27953))
+
 ## 1.79.0
 
 ### Minor Changes
