@@ -73,6 +73,12 @@ export function setScenarioEngineHost(host: ScenarioEngineHost | undefined): voi
   engineHost = host;
 }
 
+/** Exercise a real external event-send failure when the engine host supports it. */
+export async function withScenarioEventSendFailure<T>(action: () => Promise<T>): Promise<T> {
+  if (!engineHost?.withEventSendFailure) throw new Error('The scenario engine host has no event-send fault fixture.');
+  return engineHost.withEventSendFailure(action);
+}
+
 function wrapForEngine(agent: any, engine: EngineVariant, pubsub?: any): any {
   if (engine === 'durable') return createDurableAgent({ agent });
   if (engine === 'evented') return createEventedAgent({ agent, pubsub });

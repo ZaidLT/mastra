@@ -100,6 +100,8 @@ export interface ScenarioEngineHost {
   getMastra(): any;
   /** Wrap a plain scenario `Agent` for this engine. */
   wrapAgent(agent: any): any;
+  /** Execute an action against a real HTTP event gateway that rejects sends. */
+  withEventSendFailure?<T>(action: () => Promise<T>): Promise<T>;
 }
 
 /** All supported engine variants for parameterised test runs. */

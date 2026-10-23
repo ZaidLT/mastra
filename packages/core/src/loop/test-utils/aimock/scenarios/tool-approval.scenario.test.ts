@@ -9,6 +9,7 @@ import {
   runApprovalScenario,
   runLoopScenario,
   useLoopScenarioAimock,
+  withScenarioEventSendFailure,
 } from '../aimock-scenario';
 
 /**
@@ -22,8 +23,6 @@ import {
  */
 describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engine => {
   const getMock = useLoopScenarioAimock();
-  // InngestAgent.resume() has no resume claim yet, so a second approval resolves instead of rejecting (#27485).
-  const itFailsOnInngest = engine === 'inngest' ? it.fails : it;
 
   const makeLookupTool = () =>
     createTool({
@@ -143,7 +142,7 @@ describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engi
 
   // A user clicking Approve twice must not run the tool twice, and the second
   // click must fail right away instead of waiting on the first run (#27365).
-  itFailsOnInngest('approving the same tool call twice runs it once and fails the second approval fast', async () => {
+  it('approving the same tool call twice runs it once and fails the second approval fast', async () => {
     let executions = 0;
     let release!: () => void;
     const gate = new Promise<void>(resolve => {
@@ -170,7 +169,7 @@ describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engi
       sharedAgent: shared,
       prompt: 'Archive a',
       memory,
-      threadId: 'double-approve-thread',
+      threadId: `double-approve-thread-${engine}-${crypto.randomUUID()}`,
       resourceId: 'double-approve-resource',
       collectChunks: true,
       fixtures: mock => {
@@ -183,19 +182,53 @@ describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engi
     });
     expect(chunks!.some(chunk => chunk.type === 'tool-call-approval')).toBe(true);
 
-    const first = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
-    const startedAt = Date.now();
-    const second = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
-    await expect(second).rejects.toMatchObject({ id: 'AGENT_RESUME_ALREADY_CLAIMED' });
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
-
-    release();
-    const resumed = await first;
-    const resumedTypes: string[] = [];
-    for await (const chunk of resumed.fullStream) resumedTypes.push(chunk.type);
-    expect(resumedTypes).not.toContain('error');
-    expect(resumedTypes).toContain('finish');
-    expect(executions).toBe(1);
+    let firstResult: any;
+    let secondResult: any;
+    let secondOutcome: any;
+    const resumedTypes: string[][] = [];
+    try {
+      const first = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
+      const startedAt = performance.now();
+      const second = shared.agent.approveToolCall({ runId: output.runId, toolCallId: 'call_archive' });
+      const settledSecond = second.then(
+        value => ({ status: 'resolved', value, elapsedMs: performance.now() - startedAt }),
+        error => ({
+          status: 'rejected',
+          error: { id: error.id, message: error.message },
+          elapsedMs: performance.now() - startedAt,
+        }),
+      );
+      let timer: ReturnType<typeof setTimeout>;
+      secondOutcome = await Promise.race([
+        settledSecond,
+        new Promise(resolve => {
+          timer = setTimeout(() => resolve({ status: 'pending', elapsedMs: performance.now() - startedAt }), 1_000);
+        }),
+      ]);
+      clearTimeout(timer!);
+      expect.soft(secondOutcome.status, 'second approval rejects promptly').toBe('rejected');
+      expect.soft(secondOutcome.error?.id, 'duplicate-approval error code').toBe('AGENT_RESUME_ALREADY_CLAIMED');
+      expect.soft(secondOutcome.elapsedMs, 'duplicate rejection deadline').toBeLessThan(1_000);
+      release();
+      firstResult = await first;
+      const drain = async (result: any) => {
+        const types: string[] = [];
+        for await (const chunk of result.fullStream) {
+          types.push(chunk.type);
+        }
+        resumedTypes.push(types);
+      };
+      const eventual = await settledSecond;
+      if (eventual.status === 'resolved') secondResult = (eventual as any).value;
+      await Promise.all([drain(firstResult), ...(secondResult ? [drain(secondResult)] : [])]);
+      expect.soft(resumedTypes[0], 'first approval completes').toContain('finish');
+      expect.soft(resumedTypes.flat(), 'resumed streams have no errors').not.toContain('error');
+      expect.soft(executions, 'tool executes once').toBe(1);
+    } finally {
+      release();
+      firstResult?.cleanup?.();
+      secondResult?.cleanup?.();
+    }
   });
 
   it('requireToolApproval in agent defaultOptions gates tool calls', async () => {
@@ -244,5 +277,117 @@ describeForAllEngines('AIMock loop scenario: tool approval suspend/resume', engi
     }
     expect(executions).toBe(1);
     expect(await resumed.text).toBe('Archived.');
+  });
+  const startClaimScenario = async (tool: ReturnType<typeof createTool>, callId: string) => {
+    const llm = getMock();
+    const memory = new MockMemory();
+    const shared = await createSharedAgent(llm, { tools: { operate: tool }, memory, engine });
+    const { output } = await runLoopScenario({
+      engine,
+      llm,
+      sharedAgent: shared,
+      prompt: 'Operate on item a.',
+      memory,
+      threadId: `claim-${engine}-${callId}-${crypto.randomUUID()}`,
+      resourceId: 'claim-reviewer',
+      collectChunks: true,
+      fixtures: mock => {
+        mock.on(
+          { endpoint: 'chat', hasToolResult: false },
+          { toolCalls: [{ id: callId, name: 'operate', arguments: { item: 'a' } }] },
+        );
+        mock.on({ endpoint: 'chat', hasToolResult: true }, { content: 'Done.' });
+      },
+    });
+    return { shared, runId: output.runId };
+  };
+
+  const readApprovalSegment = async (output: any) => {
+    const chunks: any[] = [];
+    for await (const chunk of output.fullStream) chunks.push(chunk);
+    return chunks;
+  };
+
+  it('a failed resume setup leaves the same approval usable (#27485)', async () => {
+    let executions = 0;
+    const tool = createTool({
+      id: 'operate',
+      description: 'Operate after approval.',
+      inputSchema: z.object({ item: z.string() }),
+      requireApproval: true,
+      execute: async () => {
+        executions++;
+        return { done: true };
+      },
+    });
+    const { shared, runId } = await startClaimScenario(tool, 'call_setup_failure');
+    await expect(
+      shared.agent.resumeStream(
+        { approved: true },
+        { runId, toolCallId: 'call_setup_failure', modelSettings: { timeout: { totalMs: -1 } } },
+      ),
+    ).rejects.toThrow(/timeout/i);
+    const result = await shared.agent.approveToolCall({ runId, toolCallId: 'call_setup_failure' });
+    const chunks = await readApprovalSegment(result);
+    expect(chunks.some(chunk => chunk.type === 'finish')).toBe(true);
+    expect(chunks.filter(chunk => chunk.type === 'error')).toEqual([]);
+    expect(executions).toBe(1);
+  });
+
+  it('the same tool can suspend again and accept a later approval (#27485)', async () => {
+    const stages: number[] = [];
+    const tool = createTool({
+      id: 'operate',
+      description: 'Complete two separately approved stages.',
+      inputSchema: z.object({ item: z.string() }),
+      requireApproval: true,
+      execute: async (_input, context) => {
+        const stage = (context?.agent?.resumeData as { stage?: number } | undefined)?.stage;
+        stages.push(stage!);
+        if (stage === 1) return context?.agent?.suspend({ nextStage: 2 });
+        return { done: true };
+      },
+    });
+    const { shared, runId } = await startClaimScenario(tool, 'call_two_stages');
+    const first = await shared.agent.resumeStream(
+      { approved: true, stage: 1 },
+      { runId, toolCallId: 'call_two_stages', closeOnSuspend: true },
+    );
+    const firstChunks = await readApprovalSegment(first);
+    expect(firstChunks.some(chunk => chunk.type === 'tool-call-suspended')).toBe(true);
+    const second = await shared.agent.resumeStream(
+      { approved: true, stage: 2 },
+      { runId, toolCallId: 'call_two_stages', closeOnSuspend: true },
+    );
+    const secondChunks = await readApprovalSegment(second);
+    expect(secondChunks.some(chunk => chunk.type === 'finish')).toBe(true);
+    expect(secondChunks.filter(chunk => chunk.type === 'error')).toEqual([]);
+    expect(stages).toEqual([1, 2]);
+  });
+
+  const itUsesInngestTransport = engine === 'inngest' ? it : it.skip;
+  itUsesInngestTransport('a failed HTTP resume dispatch releases its claim (#27485)', async () => {
+    let executions = 0;
+    const tool = createTool({
+      id: 'operate',
+      description: 'Operate after approval.',
+      inputSchema: z.object({ item: z.string() }),
+      requireApproval: true,
+      execute: async () => {
+        executions++;
+        return { done: true };
+      },
+    });
+    const { shared, runId } = await startClaimScenario(tool, 'call_dispatch_failure');
+    await expect(
+      withScenarioEventSendFailure(() =>
+        shared.agent.resumeStream({ approved: true }, { runId, toolCallId: 'call_dispatch_failure' }),
+      ),
+    ).rejects.toThrow(/fixture dispatch unavailable/);
+    const result = await shared.agent.approveToolCall({ runId, toolCallId: 'call_dispatch_failure' });
+    const chunks = await readApprovalSegment(result);
+    expect(chunks.some(chunk => chunk.type === 'finish')).toBe(true);
+    expect(chunks.filter(chunk => chunk.type === 'error')).toEqual([]);
+    expect(executions).toBe(1);
   });
 });

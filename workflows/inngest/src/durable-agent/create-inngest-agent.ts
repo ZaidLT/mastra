@@ -54,6 +54,7 @@ import {
   deleteRunRegistryEntry,
   publishAbortRequest,
   normalizeResumeGenerateArgs,
+  markResumeInFlight,
   validateModelTimeoutSettings,
   DurableStepIds,
 } from '@mastra/core/agent/durable';
@@ -1094,6 +1095,69 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
     void requestRemoteAbort(runId);
   }
 
+  function withResumeClaim(
+    resumeRun: (
+      runId: string,
+      resumeData: unknown,
+      resumeOptions: InngestAgentResumeOptions<TOutput> | undefined,
+      releaseResumeMarker: () => void,
+    ) => Promise<InngestAgentStreamResult<TOutput>>,
+  ): InngestAgent<TOutput>['resume'] {
+    return async (runId, resumeData, resumeOptions) => {
+      if (agentThreadStreamRuntime.isResumeFenced(runId, agent.getPubSub())) {
+        await deleteFencedSuspendedRun(runId);
+        throw new MastraError({
+          id: 'AGENT_RESUME_ABORTED_RUN',
+          domain: ErrorDomain.AGENT,
+          category: ErrorCategory.USER,
+          text: `InngestAgent "${agent.name}" resume() cannot resume aborted run "${runId}".`,
+          details: { agentName: agent.name, runId },
+        });
+      }
+      // Delegate to the resume idle-loop wrapper when `untilIdle` is set.
+      // After the resumed segment completes, the wrapper runs
+      // `agent.stream([], ...)` continuations against the same thread until
+      // pending background tasks settle.
+      if (resumeOptions?.untilIdle) {
+        const { untilIdle, ...rest } = resumeOptions;
+        const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
+        return runResumeDurableStreamUntilIdle<TOutput>(
+          proxyRef as any,
+          runId,
+          resumeData,
+          { ...rest, maxIdleMs } as any,
+          {
+            activeStreams: activeStreamUntilIdle,
+            bgManager: mastra?.backgroundTaskManager,
+          },
+        ) as Promise<InngestAgentStreamResult<TOutput>>;
+      }
+
+      // Claim before any asynchronous resume setup, matching core (#27485).
+      const toolCallId = resumeOptions?.toolCallId;
+      let releaseResumeMarker = () => {};
+      if (toolCallId !== undefined) {
+        const release = markResumeInFlight(runId, toolCallId);
+        if (!release) {
+          throw new MastraError({
+            id: 'AGENT_RESUME_ALREADY_CLAIMED',
+            domain: ErrorDomain.AGENT,
+            category: ErrorCategory.USER,
+            text: `InngestAgent "${agent.name}" resume(${runId}) cannot resume the run because another resume of it is already running.`,
+            details: { agentName: agent.name, runId, toolCallId },
+          });
+        }
+        releaseResumeMarker = release;
+      }
+      try {
+        return await resumeRun(runId, resumeData, resumeOptions, releaseResumeMarker);
+      } catch (error) {
+        releaseResumeMarker();
+        throw error;
+      }
+    };
+  }
+
   // Return the InngestAgent object (Agent methods are added by the Proxy below)
   const inngestAgent: Pick<
     InngestAgent<TOutput>,
@@ -1380,36 +1444,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       return result as InngestAgentStreamResult<TOutput>;
     },
 
-    async resume(runId, resumeData, resumeOptions): Promise<InngestAgentStreamResult<TOutput>> {
-      if (agentThreadStreamRuntime.isResumeFenced(runId, agent.getPubSub())) {
-        await deleteFencedSuspendedRun(runId);
-        throw new MastraError({
-          id: 'AGENT_RESUME_ABORTED_RUN',
-          domain: ErrorDomain.AGENT,
-          category: ErrorCategory.USER,
-          text: `InngestAgent "${agent.name}" resume() cannot resume aborted run "${runId}".`,
-          details: { agentName: agent.name, runId },
-        });
-      }
-      // Delegate to the resume idle-loop wrapper when `untilIdle` is set.
-      // After the resumed segment completes, the wrapper runs
-      // `agent.stream([], ...)` continuations against the same thread until
-      // pending background tasks settle.
-      if (resumeOptions?.untilIdle) {
-        const { untilIdle, ...rest } = resumeOptions;
-        const maxIdleMs = typeof untilIdle === 'object' ? untilIdle.maxIdleMs : undefined;
-        return runResumeDurableStreamUntilIdle<TOutput>(
-          proxyRef as any,
-          runId,
-          resumeData,
-          { ...rest, maxIdleMs } as any,
-          {
-            activeStreams: activeStreamUntilIdle,
-            bgManager: mastra?.backgroundTaskManager,
-          },
-        ) as Promise<InngestAgentStreamResult<TOutput>>;
-      }
-
+    resume: withResumeClaim(async function resumeRun(runId, resumeData, resumeOptions, releaseResumeMarker) {
       const existingRegistryEntry = getRunRegistryEntry(runId, mastra);
       const priorExecution = existingRegistryEntry?.workflowExecution;
 
@@ -1540,6 +1575,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         globalRunRegistry.set(runId, existingEntry);
       }
       existingEntry.abortController = abortController;
+      existingEntry.resumeToolCallId = resumeOptions?.toolCallId;
       // Steps and stream-side processors on this segment see the merged
       // context, as core `DurableAgent.resume` does.
       existingEntry.requestContext = callbackOptions.requestContext;
@@ -1560,6 +1596,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
       // (finish/error/abort/cleanup) always tear down the registry entry.
       let resumeCleanedUp = false;
       const finalizeResumeRegistry = () => {
+        releaseResumeMarker();
         clearTotalTimeout();
         if (resumeCleanedUp) return;
         resumeCleanedUp = true;
@@ -1629,6 +1666,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
           try {
             await callbackOptions.onSuspended?.(data);
           } finally {
+            releaseResumeMarker();
             if (resumeOptions?.closeOnSuspend) detachStream();
           }
         },
@@ -1832,7 +1870,7 @@ export function createInngestAgent<TOutput = undefined>(options: CreateInngestAg
         // subscription on suspend without dropping the resumed registry entry.
         [STREAM_CLEANUP]: streamCleanup,
       } as InngestAgentStreamResult<TOutput>;
-    },
+    }),
 
     async prepare(messages, prepareOptions) {
       const preparation = await prepareForDurableExecution<TOutput>({

@@ -111,6 +111,7 @@ export {
   setRunRegistryEntry,
   deleteRunRegistryEntry,
   takeRunScorerInstances,
+  markResumeInFlight,
   type ExtendedRunRegistryEntry,
 } from './run-registry';
 
