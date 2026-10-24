@@ -149,6 +149,7 @@ describe('Multi-framework serve', () => {
       const connectOptions = inngestConnect.mock.calls[0][0];
       expect(getFunctionIds(serveOptions.functions)).toEqual([
         'workflow.inngest:durable-agentic-loop',
+        'workflow.inngest:durable-agentic-loop.lifecycle',
         'workflow.inngest:durable-agentic-execution',
       ]);
       expect(getFunctionIds(connectOptions.apps[0].functions)).toEqual(getFunctionIds(serveOptions.functions));

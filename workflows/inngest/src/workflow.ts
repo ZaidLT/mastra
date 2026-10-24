@@ -19,6 +19,7 @@ import type {
 } from '@mastra/core/workflows';
 import { NonRetriableError } from 'inngest';
 import type { Inngest } from 'inngest';
+import { createExecutionLifecycleFunction, INNGEST_AGENTIC_LOOP_ID } from './durable-agent/execution-lifecycle';
 import { InngestExecutionEngine } from './execution-engine';
 import {
   compactNestedWorkflowResult,
@@ -168,6 +169,7 @@ export class InngestWorkflow<
 
   private function: ReturnType<Inngest['createFunction']> | undefined;
   private cronFunction: ReturnType<Inngest['createFunction']> | undefined;
+  private lifecycleFunction: ReturnType<Inngest['createFunction']> | undefined;
   private readonly flowControlConfig?: InngestFlowControlConfig;
   private readonly functionRetries: NonNullable<InngestFlowControlConfig['retries']>;
   private readonly cronConfig?: InngestFlowCronConfig<TInput, TState>;
@@ -808,8 +810,19 @@ export class InngestWorkflow<
   }
 
   getFunctions(): ReturnType<Inngest['createFunction']>[] {
+    if (this.id === INNGEST_AGENTIC_LOOP_ID && !this.lifecycleFunction) {
+      this.lifecycleFunction = createExecutionLifecycleFunction(
+        this.inngest,
+        this.getFunction().id(this.inngest.id),
+        () => {
+          const defaultPubsub = new InngestPubSub(this.inngest, this.id, this.logger);
+          return this.#pubsubFactory?.(defaultPubsub) ?? defaultPubsub;
+        },
+      );
+    }
     return [
       this.getFunction(),
+      ...(this.lifecycleFunction ? [this.lifecycleFunction] : []),
       ...(this.cronConfig?.cron ? [this.createCronFunction()] : []),
       ...this.getNestedFunctions(this.executionGraph.steps),
     ];

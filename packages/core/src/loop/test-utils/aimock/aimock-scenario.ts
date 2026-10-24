@@ -65,12 +65,23 @@ let scenarioAgentCounter = 0;
 
 let engineHost: ScenarioEngineHost | undefined;
 
+/** Test-only capability for faults at the external worker HTTP boundary. */
+export function getApprovalLifecycleHost(): ScenarioEngineHost['approvalLifecycle'] {
+  return engineHost?.approvalLifecycle;
+}
+
 /**
  * Run every `describeForAllEngines` scenario on an engine that lives outside core (e.g. Inngest).
  * Call from a vitest setup file in the package that provides the engine.
  */
 export function setScenarioEngineHost(host: ScenarioEngineHost | undefined): void {
   engineHost = host;
+}
+
+/** Exercise a real external event-send failure when the engine host supports it. */
+export async function withScenarioEventSendFailure<T>(action: () => Promise<T>): Promise<T> {
+  if (!engineHost?.withEventSendFailure) throw new Error('The scenario engine host has no event-send fault fixture.');
+  return engineHost.withEventSendFailure(action);
 }
 
 function wrapForEngine(agent: any, engine: EngineVariant, pubsub?: any): any {

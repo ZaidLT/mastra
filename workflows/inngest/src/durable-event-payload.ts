@@ -26,6 +26,8 @@ import type { RequestContext } from '@mastra/core/request-context';
 
 /** Per-call signals that every durable event carries, regardless of sender. */
 interface PerCallSignals {
+  /** Internal correlation for one dispatched agent execution; never a resume deduplication key. */
+  __mastraExecutionId?: string;
   /**
    * Actor signal used for FGA checks and tool execution. Always a per-call
    * value: it is supplied fresh on every start and resume and is never read

@@ -96,6 +96,30 @@ export type EngineVariant = 'normal' | 'durable' | 'evented' | 'fs' | 'inngest';
  * this engine; the host wraps each scenario agent and owns the Mastra instance that serves it.
  */
 export interface ScenarioEngineHost {
+  /** Test-only native lifecycle controls; absent on engines without an external scheduler. */
+  approvalLifecycle?: {
+    remote?(mode: 'cancel' | 'exhausted', modelUrl: string): Promise<any>;
+    arm(
+      runId: string,
+      mode: 'cancel' | 'exhausted' | 'transient' | 'healthy' | 'normal-error' | 'stale' | 'delayed-finish',
+    ): {
+      waitForRequest(): Promise<void>;
+      waitForRetry(): Promise<void>;
+      waitForLifecycleRequest(): Promise<void>;
+      waitForLifecycleDelivery(): Promise<void>;
+      releaseLifecycle(): void;
+      releaseDelivery(): void;
+      waitForHeldDelivery(): Promise<void>;
+      waitForNotification(): Promise<void>;
+      releaseRetry(): void;
+      release(): void;
+      cancel(): Promise<void>;
+      waitForTerminal(): Promise<any>;
+      snapshot(): any;
+      cleanup(): Promise<void>;
+    };
+  };
+  withEventSendFailure?<T>(action: () => Promise<T>): Promise<T>;
   engine: EngineVariant;
   /** Mastra instance the engine's worker resolves agents from. Scenario agents are added to it. */
   getMastra(): any;

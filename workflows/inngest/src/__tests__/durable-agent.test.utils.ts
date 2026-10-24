@@ -21,6 +21,11 @@ import { Inngest } from 'inngest';
 import { serve as inngestServe } from '../index';
 import type { InngestFlowControlConfig } from '../types';
 import type { InngestWorkflow } from '../workflow';
+import {
+  createApprovalLifecycleObserver,
+  interceptApprovalLifecycleRequest,
+  LifecycleAuditedPubSub,
+} from './approval-lifecycle-host';
 import { ensureInngestCliBinary } from './inngest-cli';
 
 // Set INNGEST_TEST_PORT_OFFSET to run several dev servers side by side (one per test worker).
@@ -248,9 +253,13 @@ export async function setupSharedTestInfrastructure({
   // The chained `.commit()` builder loses the InngestWorkflow subtype, so cast back.
   (workflow as unknown as InngestWorkflow).__setPubsubFactory(
     defaultPubsub =>
-      new CachingPubSub(defaultPubsub, getSharedMastra().serverCache, {
-        shouldCache: topic => topic.startsWith('agent.stream.'),
-      }),
+      new (process.env.AIMOCK_APPROVAL_LIFECYCLE === '1' ? LifecycleAuditedPubSub : CachingPubSub)(
+        defaultPubsub,
+        getSharedMastra().serverCache,
+        {
+          shouldCache: topic => topic.startsWith('agent.stream.'),
+        },
+      ),
   );
 
   // Create shared Mastra instance with the workflow pre-registered
@@ -270,7 +279,13 @@ export async function setupSharedTestInfrastructure({
         {
           path: '/inngest/api',
           method: 'ALL',
-          createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }) as unknown as ApiRouteHandler,
+          createHandler: async ({ mastra }) =>
+            inngestServe({
+              mastra,
+              inngest,
+              functions:
+                process.env.AIMOCK_APPROVAL_LIFECYCLE === '1' ? [createApprovalLifecycleObserver(inngest)] : [],
+            }) as unknown as ApiRouteHandler,
         },
       ],
     },
@@ -283,7 +298,10 @@ export async function setupSharedTestInfrastructure({
   // Create and start shared server
   const app = await createHonoServer(sharedMastra);
   sharedServer = serve({
-    fetch: app.fetch,
+    fetch:
+      process.env.AIMOCK_APPROVAL_LIFECYCLE === '1'
+        ? request => interceptApprovalLifecycleRequest(request, app.fetch)
+        : app.fetch,
     port: HANDLER_PORT,
   });
 
