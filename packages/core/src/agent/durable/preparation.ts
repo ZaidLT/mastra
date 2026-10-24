@@ -7,7 +7,9 @@ import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
 import type { MastraLanguageModel, MastraModelConfig } from '../../llm/model/shared.types';
 import type { IMastraLogger } from '../../logger';
 import type { Mastra } from '../../mastra';
+import { createRunScope } from '../../mastra/run-scope';
 import type { MastraMemory } from '../../memory/memory';
+import { MemoryRunState } from '../../memory/run-state';
 import type { MemoryConfig, MemoryConfig as _MemoryConfig, StorageThreadType } from '../../memory/types';
 import { EntityType, SpanType, createObservabilityContext, getOrCreateSpan } from '../../observability';
 import type {
@@ -57,6 +59,7 @@ import {
   applyClientToolModelOutput,
   fireClientToolOutputHooks,
 } from '../workflows/prepare-stream/client-tool-output-hooks';
+import { MEMORY_RUN_STATE_KEY } from '../workflows/prepare-stream/run-scope-keys';
 import { MASTRA_DURABLE_EXECUTIONS_KEY } from './execution-fence';
 import { authorizeDurableMemory } from './memory-fga';
 import { recordRunSavedMessages } from './run-message-refs';
@@ -501,6 +504,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // config, and the injector is silently omitted — so stored working memory is
   // saved by the update-working-memory tool but never read back into the prompt.
   // Setting the context first keeps read (inject) and write (tool) in sync.
+  const runScope = createRunScope();
   const memory = await typedAgent.getMemory({ requestContext });
   const memoryConfig = execOptions?.memory?.options;
   const memoryAuthorizationChecks = new Map<MastraFGAPermissionInput, Promise<void>>();
@@ -534,7 +538,23 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
         saveThread: true,
       }));
     threadExists = true;
-    requestContext.set('MastraMemory', { thread: threadObject, resourceId, memoryConfig });
+    runScope.set(
+      MEMORY_RUN_STATE_KEY,
+      new MemoryRunState({
+        memory,
+        threadId,
+        resourceId,
+        thread: threadObject,
+        ownershipValidated: true,
+      }),
+    );
+    // Keep the live accessor out of workflow snapshot serialization.
+    requestContext.set(
+      'MastraMemory',
+      Object.defineProperty({ thread: threadObject, resourceId, memoryConfig }, 'runState', {
+        value: () => runScope.get(MEMORY_RUN_STATE_KEY),
+      }),
+    );
   } else {
     // This run has no complete per-request memory context. Clear any
     // MastraMemory inherited from a caller-provided requestContext (e.g. a
@@ -931,6 +951,7 @@ export async function prepareForDurableExecution<OUTPUT = undefined>(
   // 14. Create registry entry for non-serializable state
   const registryEntry: RunRegistryEntry = {
     mastra,
+    runScope,
     tools,
     requestTools: tools,
     saveQueueManager,

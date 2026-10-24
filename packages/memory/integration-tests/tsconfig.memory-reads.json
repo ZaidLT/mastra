@@ -1,0 +1,11 @@
+{
+  "extends": "../../core/tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@mastra/core": ["../../core/src/index.ts"],
+      "@mastra/core/*": ["../../core/src/*"]
+    }
+  },
+  "include": ["src/durable-memory-reads.scenario.test.ts", "vitest.memory-reads.config.ts"],
+  "exclude": ["node_modules"]
+}

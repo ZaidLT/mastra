@@ -33,6 +33,7 @@ import { endPendingProviderToolSpan } from '../../../../loop/workflows/agentic-e
 import type { PendingProviderToolCall } from '../../../../loop/workflows/agentic-execution/provider-tool-spans';
 import type { Mastra } from '../../../../mastra';
 import { createRunScope } from '../../../../mastra/run-scope';
+import { MemoryRunState } from '../../../../memory/run-state';
 import type {
   AIModelGenerationSpan,
   ExportedSpan,
@@ -73,6 +74,7 @@ import { isDownloadAssetsError } from '../../../message-list/prompt/download-ass
 import { createSignal } from '../../../signals';
 import { TripWire } from '../../../trip-wire';
 import { isSupportedLanguageModel } from '../../../utils';
+import { MEMORY_RUN_STATE_KEY } from '../../../workflows/prepare-stream/run-scope-keys';
 import { ensureRemoteAbortListener } from '../../abort-transport';
 import { DurableStepIds } from '../../constants';
 import { ExecutionFence, getExecutionOwnershipGuard } from '../../execution-fence';
@@ -241,16 +243,17 @@ type LLMExecutionParams = ExecuteFunctionParams<
   DefaultEngineType
 >;
 
-type StepLifetime = { closed: boolean };
+type StepLifetime = { closed: boolean; cleanupMemory?: () => void };
 
 /** Close on failure too, so retained callbacks never write to an abandoned step. */
 function withStepLifetime<Params, Result>(execute: (params: Params, lifetime: StepLifetime) => Promise<Result>) {
   return async (params: Params): Promise<Result> => {
-    const lifetime = { closed: false };
+    const lifetime: StepLifetime = { closed: false };
     try {
       return await execute(params, lifetime);
     } finally {
       lifetime.closed = true;
+      lifetime.cleanupMemory?.();
     }
   };
 }
@@ -319,6 +322,34 @@ export function createDurableLLMExecutionStep(_options?: DurableLLMExecutionStep
         stepLifetime.closed = true;
         return storeMessageListState(params, messageList.serialize());
       };
+      // Read memoization belongs to this LLM segment. Tools and later approvals
+      // can write memory, so none of its cached rows survive this step.
+      const memoryEntry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
+      const memory = resolved.memory;
+      const { threadId, resourceId, memoryConfig } = typedInput.state;
+      if (memoryEntry && memory && threadId && resourceId) {
+        const scope = (memoryEntry.runScope ??= createRunScope());
+        let memoryState = scope.get(MEMORY_RUN_STATE_KEY);
+        if ((typedInput.stepIndex ?? 0) > 0 || !memoryState?.matches(memory, threadId, resourceId)) {
+          // A remote or recovered worker must load its own rows. No ownership
+          // decision or memory snapshot is transferred from another process.
+          memoryState = new MemoryRunState({ memory, threadId, resourceId });
+          scope.set(MEMORY_RUN_STATE_KEY, memoryState);
+        }
+        const currentState = memoryState;
+        // Snapshots can clone request context; the live accessor is process-local.
+        requestContext.set(
+          'MastraMemory',
+          Object.defineProperty(
+            { thread: currentState.thread ?? { id: threadId }, resourceId, memoryConfig },
+            'runState',
+            { value: () => scope.get(MEMORY_RUN_STATE_KEY) },
+          ),
+        );
+        stepLifetime.cleanupMemory = () => {
+          if (scope.get(MEMORY_RUN_STATE_KEY) === currentState) scope.delete(MEMORY_RUN_STATE_KEY);
+        };
+      }
       const signalOwner = getRunRegistryEntry(runId, mastra as Mastra | undefined);
       const enqueuePendingSignal = signalOwner?.enqueuePendingSignal;
       const lateSignalSink: ProcessorLateSignalSink | undefined = enqueuePendingSignal
