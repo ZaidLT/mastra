@@ -3,7 +3,7 @@ import { it, expect } from 'vitest';
 import { Memory } from '../../../../../../memory/src';
 import type { MastraDBMessage } from '../../../../agent/message-list';
 import { MockMemory } from '../../../../memory/mock';
-import type { OutputProcessor } from '../../../../processors';
+import type { OutputProcessor, Processor } from '../../../../processors';
 import { InMemoryStore } from '../../../../storage';
 import {
   createSharedAgent,
@@ -110,12 +110,17 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
     expect(serialized).toContain('WM_DARK_MODE');
   });
 
-  // #28565: a working-memory signal before the first response must not give an
-  // output processor ownership of the previous turn's stored reply.
+  // #28565: either a working-memory signal or a processor's sendSignal before
+  // the first response must not give an output processor ownership of history.
   for (const method of ['stream', 'generate'] as const) {
-    it.each([true, false])(
-      `${method}: processing a new reply preserves the earlier reply (stored working memory: %s)`,
-      async storedWorkingMemory => {
+    it.each([
+      { signalSource: 'working-memory', signalEnabled: true },
+      { signalSource: 'working-memory', signalEnabled: false },
+      { signalSource: 'processor', signalEnabled: true },
+      { signalSource: 'processor', signalEnabled: false },
+    ] as const)(
+      `${method}: processing a new reply preserves the earlier reply ($signalSource signal: $signalEnabled)`,
+      async ({ signalSource, signalEnabled }) => {
         const llm = getMock();
         const threadId = 'working-memory-response-thread';
         const resourceId = 'working-memory-response-resource';
@@ -124,17 +129,23 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
           options: {
             generateTitle: false,
             semanticRecall: false,
-            workingMemory: { enabled: true, scope: 'resource' },
-            observationalMemory: {
-              enabled: true,
-              observation: {
-                manageWorkingMemory: true,
-                model: createOpenAI({ apiKey: 'aimock-test-key', baseURL: `${llm.url}/v1` }).chat(SCENARIO_MODEL_ID),
-                messageTokens: 100_000,
-                bufferTokens: false,
-              },
-              reflection: { observationTokens: 100_000 },
-            },
+            ...(signalSource === 'working-memory'
+              ? {
+                  workingMemory: { enabled: true, scope: 'resource' as const },
+                  observationalMemory: {
+                    enabled: true,
+                    observation: {
+                      manageWorkingMemory: true,
+                      model: createOpenAI({ apiKey: 'aimock-test-key', baseURL: `${llm.url}/v1` }).chat(
+                        SCENARIO_MODEL_ID,
+                      ),
+                      messageTokens: 100_000,
+                      bufferTokens: false as const,
+                    },
+                    reflection: { observationTokens: 100_000 },
+                  },
+                }
+              : {}),
           },
         });
         await memory.saveThread({
@@ -174,7 +185,7 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
         await memory.saveMessages({ messages: [earlierReply] });
         const before = (await memory.recall({ threadId, resourceId })).messages.find(m => m.id === earlierReply.id)!;
         const earlierContent = structuredClone(before.content);
-        if (storedWorkingMemory) {
+        if (signalSource === 'working-memory' && signalEnabled) {
           await memory.updateWorkingMemory({
             threadId,
             resourceId,
@@ -182,6 +193,18 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
           });
         }
 
+        const processorSignal = 'Use the current request when checking the new order.';
+        const signalSteps: number[] = [];
+        const announceRequest: Processor = {
+          id: 'announce-current-request',
+          processInputStep: async ({ messageList, stepNumber, sendSignal }) => {
+            signalSteps.push(stepNumber);
+            if (stepNumber === 0) {
+              await sendSignal({ type: 'reactive', contents: processorSignal });
+            }
+            return messageList;
+          },
+        };
         const processorMessages: string[][] = [];
         const tagReply: OutputProcessor = {
           id: 'tag-current-request',
@@ -197,7 +220,11 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
           },
         };
         llm.on({ endpoint: 'chat' }, { content: 'Your new order is ready.' });
-        const { agent } = await createSharedAgent(llm, { engine, memory });
+        const { agent } = await createSharedAgent(llm, {
+          engine,
+          memory,
+          inputProcessors: signalSource === 'processor' && signalEnabled ? [announceRequest] : [],
+        });
         const result = await agent[method]('Check my new order.', {
           memory: { thread: threadId, resource: resourceId },
           outputProcessors: [tagReply],
@@ -238,7 +265,12 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
         expect(llm.getRequests()).toHaveLength(1);
         const prompt = JSON.stringify(llm.getRequests()[0]?.body.messages);
         expect(prompt).toContain('Your earlier order shipped.');
-        if (storedWorkingMemory) expect(prompt).toContain('Prefers email updates.');
+        if (signalSource === 'working-memory' && signalEnabled) expect(prompt).toContain('Prefers email updates.');
+        if (signalSource === 'processor') {
+          expect(signalSteps).toEqual(signalEnabled ? [0] : []);
+          if (signalEnabled) expect(prompt).toContain(processorSignal);
+          else expect(prompt).not.toContain(processorSignal);
+        }
       },
     );
   }
