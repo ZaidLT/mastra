@@ -9,6 +9,22 @@ function assistant(id: string, parts: MastraDBMessage['content']['parts'], creat
 }
 
 describe('MessageList response boundary', () => {
+  it('separates the current reply when a signal has no matching response id and later history was recalled', () => {
+    const list = new MessageList({ threadId: 't' });
+    list.add(assistant('current', [{ type: 'text', text: 'Before the signal' }], new Date(1_000)), 'response');
+    list.add(assistant('recalled', [{ type: 'text', text: 'Recalled history' }], new Date(2_000)), 'memory');
+
+    const nextId = list.rotateResponseMessageId('missing');
+    list.addSignal(createSignal({ type: 'reactive', contents: 'reminder' }));
+    list.add(assistant(nextId, [{ type: 'text', text: 'After the signal' }], new Date(3_000)), 'response');
+
+    expect(list.get.response.db().map(message => message.id)).toEqual(['current', nextId]);
+    expect(list.get.all.db().find(message => message.id === 'current')?.content.metadata).toMatchObject({
+      mastra: { responseBoundary: true },
+    });
+    expect(list.get.all.db().find(message => message.id === 'recalled')?.content.metadata).toBeUndefined();
+  });
+
   it('folds late parts for a rotated message into that message instead of replacing it', () => {
     const list = new MessageList({ threadId: 't' });
     list.add({ role: 'user', content: 'Hello' }, 'input');
@@ -77,7 +93,7 @@ describe('MessageList response boundary', () => {
     expect(running[0]!.content.parts.some(part => part.type === 'text')).toBe(false);
   });
 
-  it('keeps a running tool call when its message was sealed by observation before the signal', () => {
+  it.each([true, false])('keeps observed tool output after a signal (explicit id: %s)', explicitSealId => {
     const list = new MessageList({ threadId: 't' });
     list.add({ role: 'user', content: 'Hello' }, 'input');
     const running = assistant(
@@ -100,7 +116,7 @@ describe('MessageList response boundary', () => {
     list.removeByIds(['running']);
     list.add(live, 'memory');
     const sealedSnapshot = structuredClone(live.content.parts);
-    list.rotateResponseMessageId('running');
+    list.rotateResponseMessageId(explicitSealId ? 'running' : undefined);
     list.addSignal(createSignal({ type: 'reactive', contents: 'reminder' }));
 
     list.add(

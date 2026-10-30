@@ -1,6 +1,18 @@
+import { createOpenAI } from '@ai-sdk/openai-v5';
 import { it, expect } from 'vitest';
+import { Memory } from '../../../../../../memory/src';
+import type { MastraDBMessage } from '../../../../agent/message-list';
 import { MockMemory } from '../../../../memory/mock';
-import { runLoopScenario, useLoopScenarioAimock, describeForAllEngines } from '../aimock-scenario';
+import type { OutputProcessor } from '../../../../processors';
+import { InMemoryStore } from '../../../../storage';
+import {
+  createSharedAgent,
+  runLoopScenario,
+  useLoopScenarioAimock,
+  describeForAllEngines,
+  isDurableEngineVariant,
+} from '../aimock-scenario';
+import { SCENARIO_MODEL_ID } from '../types';
 
 /**
  * Regression class: working-memory persistence + injection across turns.
@@ -97,4 +109,155 @@ describeForAllEngines('AIMock loop scenario: working memory', engine => {
     const serialized = JSON.stringify(requests[0]?.body?.messages ?? []);
     expect(serialized).toContain('WM_DARK_MODE');
   });
+
+  // #28565: a working-memory signal before the first response must not give an
+  // output processor ownership of the previous turn's stored reply.
+  for (const method of ['stream', 'generate'] as const) {
+    it.each([true, false])(
+      `${method}: processing a new reply preserves the earlier reply (stored working memory: %s)`,
+      async storedWorkingMemory => {
+        const llm = getMock();
+        const threadId = 'working-memory-response-thread';
+        const resourceId = 'working-memory-response-resource';
+        const memory = new Memory({
+          storage: new InMemoryStore(),
+          options: {
+            generateTitle: false,
+            semanticRecall: false,
+            workingMemory: { enabled: true, scope: 'resource' },
+            observationalMemory: {
+              enabled: true,
+              observation: {
+                manageWorkingMemory: true,
+                model: createOpenAI({ apiKey: 'aimock-test-key', baseURL: `${llm.url}/v1` }).chat(SCENARIO_MODEL_ID),
+                messageTokens: 100_000,
+                bufferTokens: false,
+              },
+              reflection: { observationTokens: 100_000 },
+            },
+          },
+        });
+        await memory.saveThread({
+          thread: {
+            id: threadId,
+            resourceId,
+            title: 'Earlier conversation',
+            metadata: {},
+            createdAt: new Date(1_000),
+            updatedAt: new Date(1_000),
+          },
+        });
+        const earlierReply: MastraDBMessage = {
+          id: 'earlier-reply',
+          role: 'assistant',
+          threadId,
+          resourceId,
+          createdAt: new Date(2_000),
+          content: {
+            format: 2,
+            metadata: { requestId: 'earlier-request' },
+            parts: [
+              {
+                type: 'tool-invocation',
+                toolInvocation: {
+                  state: 'result',
+                  toolCallId: 'earlier-lookup',
+                  toolName: 'lookup',
+                  args: {},
+                  result: 'An earlier order',
+                },
+              },
+              { type: 'text', text: 'Your earlier order shipped.' },
+            ],
+          },
+        };
+        await memory.saveMessages({ messages: [earlierReply] });
+        const before = (await memory.recall({ threadId, resourceId })).messages.find(m => m.id === earlierReply.id)!;
+        const earlierContent = structuredClone(before.content);
+        if (storedWorkingMemory) {
+          await memory.updateWorkingMemory({
+            threadId,
+            resourceId,
+            workingMemory: '# Notes\n- Prefers email updates.',
+          });
+        }
+
+        const processorMessages: string[][] = [];
+        const tagReply: OutputProcessor = {
+          id: 'tag-current-request',
+          processOutputResult: async ({ messages }) => {
+            processorMessages.push(messages.map(message => message.id));
+            return messages.map(message => ({
+              ...message,
+              content: {
+                ...message.content,
+                metadata: { ...message.content.metadata, requestId: 'current-request' },
+              },
+            }));
+          },
+        };
+        llm.on({ endpoint: 'chat' }, { content: 'Your new order is ready.' });
+        const { agent } = await createSharedAgent(llm, { engine, memory });
+        const result = await agent[method]('Check my new order.', {
+          memory: { thread: threadId, resource: resourceId },
+          outputProcessors: [tagReply],
+          returnScorerData: true,
+        });
+        const output = result.output ?? result;
+        let full;
+        try {
+          if (method === 'stream') await output.consumeStream();
+          full = method === 'stream' ? await output.getFullOutput() : result;
+        } finally {
+          result.cleanup?.();
+        }
+
+        expect(full.text).toBe('Your new order is ready.');
+        const { messages: saved } = await memory.recall({ threadId, resourceId, hideSignals: false });
+        expect(saved.find(message => message.id === earlierReply.id)?.content).toEqual(earlierContent);
+        const currentReplies = saved.filter(message => message.role === 'assistant' && message.id !== earlierReply.id);
+        expect(currentReplies).toHaveLength(1);
+        expect(currentReplies[0]?.content.metadata?.requestId).toBe('current-request');
+        expect(processorMessages).toEqual([[currentReplies[0]!.id]]);
+        // Durable outputs can dehydrate dbMessages; scoringData hydrates the run's
+        // response from storage and must contain exactly the current reply there too.
+        if (!isDurableEngineVariant(engine)) {
+          expect(full.response.dbMessages.map((message: MastraDBMessage) => message.id)).toEqual([
+            currentReplies[0]!.id,
+          ]);
+        }
+        // Inngest does not forward returnScorerData to its stream adapter; the
+        // independent expected failure below keeps that existing gap visible.
+        if (engine !== 'inngest') {
+          expect(full.scoringData.output.map((message: MastraDBMessage) => message.id)).toEqual([
+            currentReplies[0]!.id,
+          ]);
+          expect(JSON.stringify(full.scoringData.output)).not.toContain('earlier-lookup');
+        }
+        expect(JSON.stringify(full.response.dbMessages)).not.toContain('earlier-lookup');
+        expect(llm.getRequests()).toHaveLength(1);
+        const prompt = JSON.stringify(llm.getRequests()[0]?.body.messages);
+        expect(prompt).toContain('Your earlier order shipped.');
+        if (storedWorkingMemory) expect(prompt).toContain('Prefers email updates.');
+      },
+    );
+  }
+
+  if (engine === 'inngest') {
+    it.fails.each(['stream', 'generate'] as const)('%s returns scorer data when requested on Inngest', async method => {
+      const llm = getMock();
+      llm.on({ endpoint: 'chat' }, { content: 'The new order is ready.' });
+      const { agent } = await createSharedAgent(llm, { engine });
+      const result = await agent[method]('Check my order.', { returnScorerData: true });
+      const output = result.output ?? result;
+      try {
+        if (method === 'stream') await output.consumeStream();
+        const full = method === 'stream' ? await output.getFullOutput() : result;
+        expect(full.text).toBe('The new order is ready.');
+        expect(full.scoringData).toMatchObject({ output: expect.any(Array) });
+      } finally {
+        result.cleanup?.();
+      }
+    });
+  }
 });
